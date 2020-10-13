@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,8 +16,7 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/hcl"
 	"github.com/hashicorp/hcl/hcl/ast"
-	"github.com/hashicorp/vault/internalshared/configutil"
-	"github.com/hashicorp/vault/sdk/helper/jsonutil"
+	"github.com/hashicorp/shared-secure-libs/configutil"
 	"github.com/hashicorp/vault/sdk/helper/parseutil"
 )
 
@@ -65,6 +65,9 @@ type Config struct {
 
 	DisableIndexing    bool        `hcl:"-"`
 	DisableIndexingRaw interface{} `hcl:"disable_indexing"`
+
+	DisableSentinelTrace    bool        `hcl:"-"`
+	DisableSentinelTraceRaw interface{} `hcl:"disable_sentinel_trace"`
 }
 
 // DevConfig is a Config that is used for dev mode of Vault.
@@ -89,7 +92,7 @@ enable_raw_endpoint = true
 storage "%s" {
 }
 
-enable_ui = true
+ui = true
 `
 
 	hclStr = fmt.Sprintf(hclStr, storageType)
@@ -166,6 +169,11 @@ func (c *Config) Merge(c2 *Config) *Config {
 	result.DisableCache = c.DisableCache
 	if c2.DisableCache {
 		result.DisableCache = c2.DisableCache
+	}
+
+	result.DisableSentinelTrace = c.DisableSentinelTrace
+	if c2.DisableSentinelTrace {
+		result.DisableSentinelTrace = c2.DisableSentinelTrace
 	}
 
 	result.DisablePrintableCheck = c.DisablePrintableCheck
@@ -372,6 +380,12 @@ func ParseConfig(d string) (*Config, error) {
 		}
 	}
 
+	if result.DisableSentinelTraceRaw != nil {
+		if result.DisableSentinelTrace, err = parseutil.ParseBool(result.DisableSentinelTraceRaw); err != nil {
+			return nil, err
+		}
+	}
+
 	if result.DisablePerformanceStandbyRaw != nil {
 		if result.DisablePerformanceStandby, err = parseutil.ParseBool(result.DisablePerformanceStandbyRaw); err != nil {
 			return nil, err
@@ -535,7 +549,7 @@ func ParseStorage(result *Config, list *ast.ObjectList, name string) error {
 			m[key] = valStr
 			continue
 		}
-		valBytes, err := jsonutil.EncodeJSON(val)
+		valBytes, err := json.Marshal(val)
 		if err != nil {
 			return err
 		}
@@ -702,6 +716,7 @@ func (c *Config) Sanitized() map[string]interface{} {
 	sharedResult := c.SharedConfig.Sanitized()
 	result := map[string]interface{}{
 		"cache_size":              c.CacheSize,
+		"disable_sentinel_trace":  c.DisableSentinelTrace,
 		"disable_cache":           c.DisableCache,
 		"disable_printable_check": c.DisablePrintableCheck,
 

@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"net/http"
@@ -41,6 +42,11 @@ const (
 	// Retry configuration
 	retryWaitMin = 500 * time.Millisecond
 	retryWaitMax = 30 * time.Second
+)
+
+var (
+	errRequestBodyNotValid              = errors.New("iam request body is invalid")
+	errInvalidGetCallerIdentityResponse = errors.New("body of GetCallerIdentity is invalid")
 )
 
 func (b *backend) pathLogin() *framework.Path {
@@ -842,6 +848,11 @@ func (b *backend) pathLoginUpdateEc2(ctx context.Context, req *logical.Request, 
 		Alias: &logical.Alias{
 			Name: identityAlias,
 		},
+		InternalData: map[string]interface{}{
+			"instance_id": identityDocParsed.InstanceID,
+			"region":      identityDocParsed.Region,
+			"account_id":  identityDocParsed.AccountID,
+		},
 	}
 	roleEntry.PopulateTokenAuth(auth)
 	if err := identityConfigEntry.EC2AuthMetadataHandler.PopulateDesiredMetadata(auth, map[string]string{
@@ -963,9 +974,9 @@ func (b *backend) pathLoginRenew(ctx context.Context, req *logical.Request, data
 }
 
 func (b *backend) pathLoginRenewIam(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
-	canonicalArn := req.Auth.Metadata["canonical_arn"]
-	if canonicalArn == "" {
-		return nil, fmt.Errorf("unable to retrieve canonical ARN from metadata during renewal")
+	canonicalArn, err := getMetadataValue(req.Auth, "canonical_arn")
+	if err != nil {
+		return nil, err
 	}
 
 	roleName := ""
@@ -996,16 +1007,19 @@ func (b *backend) pathLoginRenewIam(ctx context.Context, req *logical.Request, d
 	// renew existing tokens.
 	if roleEntry.InferredEntityType != "" {
 		if roleEntry.InferredEntityType == ec2EntityType {
-			instanceID, ok := req.Auth.Metadata["inferred_entity_id"]
-			if !ok {
-				return nil, fmt.Errorf("no inferred entity ID in auth metadata")
-			}
-			instanceRegion, ok := req.Auth.Metadata["inferred_aws_region"]
-			if !ok {
-				return nil, fmt.Errorf("no inferred AWS region in auth metadata")
-			}
-			_, err := b.validateInstance(ctx, req.Storage, instanceID, instanceRegion, req.Auth.Metadata["account_id"])
+			instanceID, err := getMetadataValue(req.Auth, "inferred_entity_id")
 			if err != nil {
+				return nil, err
+			}
+			instanceRegion, err := getMetadataValue(req.Auth, "inferred_aws_region")
+			if err != nil {
+				return nil, err
+			}
+			accountID, err := getMetadataValue(req.Auth, "account_id")
+			if err != nil {
+				b.Logger().Debug("account_id not present during iam renewal attempt, continuing to attempt validation")
+			}
+			if _, err := b.validateInstance(ctx, req.Storage, instanceID, instanceRegion, accountID); err != nil {
 				return nil, errwrap.Wrapf(fmt.Sprintf("failed to verify instance ID %q: {{err}}", instanceID), err)
 			}
 		} else {
@@ -1027,9 +1041,9 @@ func (b *backend) pathLoginRenewIam(ctx context.Context, req *logical.Request, d
 		//    implies that roleEntry.ResolveAWSUniqueIDs is true)
 		// 2: roleEntry.ResolveAWSUniqueIDs is false and canonical_arn is in roleEntry.BoundIamPrincipalARNs
 		// 3: Full ARN matches one of the wildcard globs in roleEntry.BoundIamPrincipalARNs
-		clientUserId, ok := req.Auth.Metadata["client_user_id"]
+		clientUserId, err := getMetadataValue(req.Auth, "client_user_id")
 		switch {
-		case ok && strutil.StrListContains(roleEntry.BoundIamPrincipalIDs, clientUserId): // check 1 passed
+		case err == nil && strutil.StrListContains(roleEntry.BoundIamPrincipalIDs, clientUserId): // check 1 passed
 		case !roleEntry.ResolveAWSUniqueIDs && strutil.StrListContains(roleEntry.BoundIamPrincipalARNs, canonicalArn): // check 2 passed
 		default:
 			// check 3 is a bit more complex, so we do it last
@@ -1070,28 +1084,22 @@ func (b *backend) pathLoginRenewIam(ctx context.Context, req *logical.Request, d
 	return resp, nil
 }
 
-func (b *backend) pathLoginRenewEc2(ctx context.Context, req *logical.Request, data *framework.FieldData) (*logical.Response, error) {
-	instanceID := req.Auth.Metadata["instance_id"]
-	if instanceID == "" {
-		return nil, fmt.Errorf("unable to fetch instance ID from metadata during renewal")
+func (b *backend) pathLoginRenewEc2(ctx context.Context, req *logical.Request, _ *framework.FieldData) (*logical.Response, error) {
+	instanceID, err := getMetadataValue(req.Auth, "instance_id")
+	if err != nil {
+		return nil, err
 	}
-
-	region := req.Auth.Metadata["region"]
-	if region == "" {
-		return nil, fmt.Errorf("unable to fetch region from metadata during renewal")
+	region, err := getMetadataValue(req.Auth, "region")
+	if err != nil {
+		return nil, err
 	}
-
-	// Ensure backwards compatibility for older clients without account_id saved in metadata
-	accountID, ok := req.Auth.Metadata["account_id"]
-	if ok {
-		if accountID == "" {
-			return nil, fmt.Errorf("unable to fetch account_id from metadata during renewal")
-		}
+	accountID, err := getMetadataValue(req.Auth, "account_id")
+	if err != nil {
+		b.Logger().Debug("account_id not present during ec2 renewal attempt, continuing to attempt validation")
 	}
 
 	// Cross check that the instance is still in 'running' state
-	_, err := b.validateInstance(ctx, req.Storage, instanceID, region, accountID)
-	if err != nil {
+	if _, err := b.validateInstance(ctx, req.Storage, instanceID, region, accountID); err != nil {
 		return nil, errwrap.Wrapf(fmt.Sprintf("failed to verify instance ID %q: {{err}}", instanceID), err)
 	}
 
@@ -1177,7 +1185,10 @@ func (b *backend) pathLoginUpdateIam(ctx context.Context, req *logical.Request, 
 	if err != nil {
 		return logical.ErrorResponse("error parsing iam_request_url"), nil
 	}
-
+	if parsedUrl.RawQuery != "" {
+		// Should be no query parameters
+		return logical.ErrorResponse(logical.ErrInvalidRequest.Error()), nil
+	}
 	// TODO: There are two potentially valid cases we're not yet supporting that would
 	// necessitate this check being changed. First, if we support GET requests.
 	// Second if we support presigned POST requests
@@ -1190,6 +1201,9 @@ func (b *backend) pathLoginUpdateIam(ctx context.Context, req *logical.Request, 
 		return logical.ErrorResponse("failed to base64 decode iam_request_body"), nil
 	}
 	body := string(bodyRaw)
+	if err = validateLoginIamRequestBody(body); err != nil {
+		return logical.ErrorResponse(err.Error()), nil
+	}
 
 	headers := data.Get("iam_request_headers").(http.Header)
 	if len(headers) == 0 {
@@ -1210,6 +1224,9 @@ func (b *backend) pathLoginUpdateIam(ctx context.Context, req *logical.Request, 
 			if err != nil {
 				return logical.ErrorResponse(fmt.Sprintf("error validating %s header: %v", iamServerIdHeader, err)), nil
 			}
+		}
+		if err = config.validateAllowedSTSHeaderValues(headers); err != nil {
+			return logical.ErrorResponse(err.Error()), nil
 		}
 		if config.STSEndpoint != "" {
 			endpoint = config.STSEndpoint
@@ -1360,8 +1377,13 @@ func (b *backend) pathLoginUpdateIam(ctx context.Context, req *logical.Request, 
 			"role_id": roleEntry.RoleID,
 		},
 		InternalData: map[string]interface{}{
-			"role_name": roleName,
-			"role_id":   roleEntry.RoleID,
+			"role_name":           roleName,
+			"role_id":             roleEntry.RoleID,
+			"canonical_arn":       entity.canonicalArn(),
+			"client_user_id":      callerUniqueId,
+			"inferred_entity_id":  inferredEntityID,
+			"inferred_aws_region": roleEntry.InferredAWSRegion,
+			"account_id":          entity.AccountNumber,
 		},
 		DisplayName: entity.FriendlyName,
 		Alias: &logical.Alias{
@@ -1385,6 +1407,29 @@ func (b *backend) pathLoginUpdateIam(ctx context.Context, req *logical.Request, 
 	return &logical.Response{
 		Auth: auth,
 	}, nil
+}
+
+// Validate that the iam_request_body passed is valid for the STS request
+func validateLoginIamRequestBody(body string) error {
+	qs, err := url.ParseQuery(body)
+	if err != nil {
+		return err
+	}
+	for k, v := range qs {
+		switch k {
+		case "Action":
+			if len(v) != 1 || v[0] != "GetCallerIdentity" {
+				return errRequestBodyNotValid
+			}
+		case "Version":
+		// Will assume for now that future versions don't change
+		// the semantics
+		default:
+			// Not expecting any other values
+			return errRequestBodyNotValid
+		}
+	}
+	return nil
 }
 
 // These two methods (hasValuesFor*) return two bools
@@ -1552,8 +1597,12 @@ func ensureHeaderIsSigned(signedHeaders, headerToSign string) error {
 }
 
 func parseGetCallerIdentityResponse(response string) (GetCallerIdentityResponse, error) {
-	decoder := xml.NewDecoder(strings.NewReader(response))
 	result := GetCallerIdentityResponse{}
+	response = strings.TrimSpace(response)
+	if !strings.HasPrefix(response, "<GetCallerIdentityResponse") && !strings.HasPrefix(response, "<?xml") {
+		return result, errInvalidGetCallerIdentityResponse
+	}
+	decoder := xml.NewDecoder(strings.NewReader(response))
 	err := decoder.Decode(&result)
 	return result, err
 }
@@ -1589,6 +1638,11 @@ func submitCallerIdentityRequest(ctx context.Context, maxRetries int, method, en
 	if response != nil {
 		defer response.Body.Close()
 	}
+	// Validate that the response type is XML
+	if ct := response.Header.Get("Content-Type"); ct != "text/xml" {
+		return nil, errInvalidGetCallerIdentityResponse
+	}
+
 	// we check for status code afterwards to also print out response body
 	responseBody, err := ioutil.ReadAll(response.Body)
 	if err != nil {
@@ -1707,6 +1761,23 @@ func (b *backend) fullArn(ctx context.Context, e *iamEntity, s logical.Storage) 
 	default:
 		return "", fmt.Errorf("unrecognized entity type: %s", e.Type)
 	}
+}
+
+// getMetadataValue attempts to get a metadata key from
+// auth.InternalData and if unset, auth.Metadata. If not
+// found, returns "".
+func getMetadataValue(fromAuth *logical.Auth, forKey string) (string, error) {
+	if raw, ok := fromAuth.InternalData[forKey]; ok {
+		if val, ok := raw.(string); ok {
+			return val, nil
+		} else {
+			return "", fmt.Errorf("unable to fetch %q from auth metadata due to type of %T", forKey, raw)
+		}
+	}
+	if val, ok := fromAuth.Metadata[forKey]; ok {
+		return val, nil
+	}
+	return "", fmt.Errorf("%q not found in auth metadata", forKey)
 }
 
 const iamServerIdHeader = "X-Vault-AWS-IAM-Server-ID"
